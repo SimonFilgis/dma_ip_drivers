@@ -3470,6 +3470,7 @@ ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 	int nents;
 	enum dma_data_direction dir = write ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
 	struct xdma_request_cb *req = NULL;
+	unsigned int req_total_len = 0;
 
 	if (!dev_hndl)
 		return -EINVAL;
@@ -3542,6 +3543,7 @@ ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 		rv = -ENOMEM;
 		goto unmap_sgl;
 	}
+	req_total_len = req->total_len;
 
 	dbg_tfr("%s, len %u sg cnt %u.\n", engine->name, req->total_len,
 		req->sw_desc_cnt);
@@ -3690,6 +3692,22 @@ unmap_sgl:
 	if (req)
 		xdma_request_free(req);
 
+	/* Streaming C2H completion length comes from FPGA writeback status
+	 * (see the loop above), not from the request we actually mapped/
+	 * submitted -- if the writeback over-reports (observed: +32 bytes,
+	 * one AXI-ST word, on some transfers), returning that inflated
+	 * value here breaks the read(2) contract callers rely on (n <=
+	 * count), corrupting the caller's buffer bookkeeping downstream.
+	 * Clamp to what was actually requested/mapped and log it so the
+	 * hardware/writeback quirk stays visible instead of silently
+	 * overrunning userspace.
+	 */
+	if (done > (ssize_t)req_total_len) {
+		pr_err("xdma %s: C2H streaming over-read: hw writeback reported %zd bytes, only %u requested/mapped -- clamping to avoid userspace buffer overrun\n",
+			engine->name, done, req_total_len);
+		done = req_total_len;
+	}
+
 	/* as long as some data is processed, return the count */
 	return done ? done : rv;
 }
@@ -3710,6 +3728,7 @@ ssize_t xdma_xfer_completion(void *cb_hndl, void *dev_hndl, int channel,
 	struct xdma_transfer *xfer;
 	int i;
 	struct xdma_result *result;
+	unsigned int req_total_len;
 
 	if (write == 1) {
 		if (channel >= xdev->h2c_channel_max) {
@@ -3743,6 +3762,7 @@ ssize_t xdma_xfer_completion(void *cb_hndl, void *dev_hndl, int channel,
 
 	xdev = engine->xdev;
 	req = cb->req;
+	req_total_len = req->total_len;
 
 	nents = req->sw_desc_cnt;
 	while (nents) {
@@ -3814,6 +3834,14 @@ unmap_sgl:
 
 	if (req)
 		xdma_request_free(req);
+
+	/* Same FPGA writeback over-report guard as xdma_xfer_submit() --
+	 * see the comment there. */
+	if (done > (ssize_t)req_total_len) {
+		pr_err("xdma %s: C2H streaming over-read (aio): hw writeback reported %zd bytes, only %u requested/mapped -- clamping to avoid userspace buffer overrun\n",
+			engine->name, done, req_total_len);
+		done = req_total_len;
+	}
 
 	return done;
 
