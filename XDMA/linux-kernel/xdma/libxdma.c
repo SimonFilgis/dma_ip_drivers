@@ -26,6 +26,7 @@
 #include <linux/errno.h>
 #include <linux/sched.h>
 #include <linux/vmalloc.h>
+#include <linux/delay.h>
 
 #include "libxdma.h"
 #include "libxdma_api.h"
@@ -569,7 +570,35 @@ static int xdma_engine_stop(struct xdma_engine *engine)
 	write_register(w, &engine->regs->control,
 			(unsigned long)(&engine->regs->control) -
 				(unsigned long)(&engine->regs));
-	/* dummy read of status register to flush all previous writes */
+
+	/*
+	 * The write above only requests a stop -- it does not confirm the
+	 * engine has actually halted. Callers (e.g. the timeout/abort path
+	 * in xdma_xfer_submit()) unmap and free the DMA target buffer right
+	 * after this function returns; if the engine is still mid-write to
+	 * that memory when that happens, it's a use-after-free via a
+	 * straggling DMA write into memory that may have since been reused
+	 * -- a real mechanism for the heap corruption seen after aborted
+	 * transfers. Poll status_rc for XDMA_STAT_BUSY to clear (bounded,
+	 * so a genuinely wedged engine can't hang this call forever) before
+	 * telling the caller it's safe to proceed.
+	 */
+	{
+		int poll_count = 0;
+		u32 status;
+
+		do {
+			status = read_register(&engine->regs->status);
+			if (!(status & XDMA_STAT_BUSY))
+				break;
+			udelay(10);
+		} while (++poll_count < 10000); /* ~100ms bound */
+
+		if (status & XDMA_STAT_BUSY)
+			pr_err("%s: engine still BUSY (status 0x%08x) %dus after stop -- caller may unmap a buffer the engine is still writing to\n",
+				engine->name, status, poll_count * 10);
+	}
+
 	dbg_tfr("%s(%s) done\n", __func__, engine->name);
 	engine->running = 0;
 	return 0;
